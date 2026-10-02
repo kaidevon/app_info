@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate NDK
+        run: |
+          if [ -z "$ANDROID_NDK_HOME" ]; then
+            ANDROID_NDK_HOME=$(ls -d $ANDROID_SDK_ROOT/ndk/* | tail -1)
+            echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+          fi
+
+      - name: Build all ABIs
+        run: |
+          "$ANDROID_NDK_HOME/ndk-build" \
+            NDK_PROJECT_PATH=. \
+            APP_BUILD_SCRIPT=./jni/Android.mk \
+            APP_ABI="arm64-v8a armeabi-v7a x86_64" \
+            APP_PLATFORM=android-21 \
+            -j$(nproc)
+
+      - name: Collect
+        run: |
+          mkdir -p dist
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            cp libs/$abi/app_info dist/app_info-$abi
+          done
+          ls -la dist
+          file dist/*
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/app_info-*
+          generate_release_notes: true

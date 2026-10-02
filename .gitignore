@@ -1,0 +1,21 @@
+cat > .gitignore << 'EOF'
+# build output
+build/
+libs/
+obj/
+*.o
+*.a
+*.so
+
+# test data (large APKs)
+test/
+
+# backups
+*.bak
+*.bak2
+
+# editor
+.vscode/
+.idea/
+*.swp
+EOF
