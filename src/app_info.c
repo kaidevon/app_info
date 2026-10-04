@@ -40,6 +40,225 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <zlib.h>
+
+/* ------------------------------------------------------------------
+ * APK mmap wrapper
+ *
+ * Single open + single mmap per file. The central directory is
+ * scanned once and shared across manifest, ARSC, signature and
+ * container lookups. Files under 4 MB use pread instead of mmap.
+ * ------------------------------------------------------------------ */
+
+/* Forward decls from below in this file */
+static uint16_t rd16le(const uint8_t *p);
+static uint32_t rd32le(const uint8_t *p);
+
+typedef struct {
+    const uint8_t *data;
+    size_t         size;
+    int            fd;
+    int            is_mmap;
+
+    struct {
+        uint32_t local_off;
+        uint32_t comp_size;
+        uint32_t uncomp_size;
+        uint16_t method;
+        int      present;
+    } man, arsc;
+
+    int  has_multidex;
+    int  has_native;
+    char abi[64];
+} apk_t;
+
+/* Find End Of Central Directory record. Returns offset, or -1. */
+static long mem_find_eocd(const uint8_t *data, size_t size) {
+    if (size < 22) return -1;
+    size_t max_back = size < 65536 ? size : 65536;
+    for (size_t i = 22; i <= max_back; i++) {
+        if (rd32le(data + size - i) == 0x06054b50)
+            return (long)(size - i);
+    }
+    return -1;
+}
+
+/* Walk the central directory once, cache manifest / arsc / abi. */
+static void apk_scan_cd(apk_t *a) {
+    long eocd = mem_find_eocd(a->data, a->size);
+    if (eocd < 0) return;
+
+    uint32_t cd_off  = rd32le(a->data + eocd + 16);
+    uint32_t cd_size = rd32le(a->data + eocd + 12);
+    uint16_t total   = rd16le(a->data + eocd + 10);
+    if (cd_size == 0 || (size_t)cd_off + cd_size > a->size) return;
+
+    uint32_t pos = cd_off;
+    for (uint16_t i = 0; i < total; i++) {
+        if (pos + 46 > cd_off + cd_size) break;
+        if (rd32le(a->data + pos) != 0x02014b50) break;
+
+        uint16_t method = rd16le(a->data + pos + 10);
+        uint32_t cs     = rd32le(a->data + pos + 20);
+        uint32_t us     = rd32le(a->data + pos + 24);
+        uint16_t fn     = rd16le(a->data + pos + 28);
+        uint16_t ex     = rd16le(a->data + pos + 30);
+        uint16_t cm     = rd16le(a->data + pos + 32);
+        uint32_t lo     = rd32le(a->data + pos + 42);
+
+        if (pos + 46 + fn > cd_off + cd_size) break;
+        const char *name = (const char *)(a->data + pos + 46);
+
+        if (fn == 19 && memcmp(name, "AndroidManifest.xml", 19) == 0) {
+            a->man.local_off   = lo;
+            a->man.comp_size   = cs;
+            a->man.uncomp_size = us;
+            a->man.method      = method;
+            a->man.present     = 1;
+        } else if (fn == 14 && memcmp(name, "resources.arsc", 14) == 0) {
+            a->arsc.local_off   = lo;
+            a->arsc.comp_size   = cs;
+            a->arsc.uncomp_size = us;
+            a->arsc.method      = method;
+            a->arsc.present     = 1;
+        } else if (fn > 7 && memcmp(name, "classes", 7) == 0 &&
+                   strcmp(name, "classes.dex") != 0) {
+            const char *p = name + 7;
+            const char *q = p;
+            int digits = 1;
+            while (*q && *q != '.') {
+                if (*q < '0' || *q > '9') { digits = 0; break; }
+                q++;
+            }
+            if (digits && strcmp(q, ".dex") == 0)
+                a->has_multidex = 1;
+        } else if (fn > 5 && memcmp(name, "lib/", 4) == 0) {
+            const char *p = name + 4;
+            const char *e = strchr(p, '/');
+            if (e && strstr(e + 1, ".so")) {
+                a->has_native = 1;
+                if (!a->abi[0]) {
+                    size_t len = (size_t)(e - p);
+                    if (len < sizeof(a->abi)) {
+                        memcpy(a->abi, p, len);
+                        a->abi[len] = 0;
+                    }
+                }
+            }
+        }
+        pos += 46 + fn + ex + cm;
+    }
+}
+
+/*
+ * Open a file and map it. Small files (< 4 MB) are read with pread;
+ * larger files are mmap'd. fd is closed before return either way.
+ */
+static int apk_open(const char *path, apk_t *a) {
+    memset(a, 0, sizeof(*a));
+    a->fd = open(path, O_RDONLY);
+    if (a->fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(a->fd, &st) != 0 || st.st_size < 22) {
+        close(a->fd);
+        a->fd = -1;
+        return -1;
+    }
+    a->size = (size_t)st.st_size;
+
+    if (a->size < 4 * 1024 * 1024) {
+        uint8_t *buf = malloc(a->size);
+        if (!buf) { close(a->fd); a->fd = -1; return -1; }
+        if (pread(a->fd, buf, a->size, 0) != (ssize_t)a->size) {
+            free(buf); close(a->fd); a->fd = -1;
+            return -1;
+        }
+        a->data    = buf;
+        a->is_mmap = 0;
+    } else {
+        void *p = mmap(NULL, a->size, PROT_READ, MAP_PRIVATE, a->fd, 0);
+        if (p == MAP_FAILED) { close(a->fd); a->fd = -1; return -1; }
+        a->data    = (const uint8_t *)p;
+        a->is_mmap = 1;
+    }
+
+    close(a->fd);
+    a->fd = -1;
+
+    apk_scan_cd(a);
+    return 0;
+}
+
+static void apk_close(apk_t *a) {
+    if (a->data) {
+        if (a->is_mmap) munmap((void *)a->data, a->size);
+        else            free((void *)a->data);
+        a->data = NULL;
+    }
+    if (a->fd >= 0) {
+        close(a->fd);
+        a->fd = -1;
+    }
+}
+
+/* Decompress one entry from the mapped file. */
+static int apk_read_entry(const apk_t *a,
+                          uint32_t local_off, uint16_t method,
+                          uint32_t cs, uint32_t us,
+                          void **out, size_t *out_size)
+{
+    *out      = NULL;
+    *out_size = 0;
+    if (us == 0) return -1;
+    if ((size_t)local_off + 30 > a->size) return -1;
+    if (rd32le(a->data + local_off) != 0x04034b50) return -1;
+
+    uint16_t l_fn = rd16le(a->data + local_off + 26);
+    uint16_t l_ex = rd16le(a->data + local_off + 28);
+    size_t   doff = (size_t)local_off + 30 + l_fn + l_ex;
+    if (doff + cs > a->size) return -1;
+
+    uint8_t *buf = malloc(us);
+    if (!buf) return -1;
+
+    if (method == 0) {
+        if (cs != us) { free(buf); return -1; }
+        memcpy(buf, a->data + doff, us);
+    } else if (method == 8) {
+        z_stream zs;
+        memset(&zs, 0, sizeof(zs));
+        zs.next_in   = (Bytef *)(a->data + doff);
+        zs.avail_in  = cs;
+        zs.next_out  = buf;
+        zs.avail_out = us;
+        if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) { free(buf); return -1; }
+        int zr = inflate(&zs, Z_FINISH);
+        inflateEnd(&zs);
+        if (zr != Z_STREAM_END) { free(buf); return -1; }
+    } else {
+        free(buf);
+        return -1;
+    }
+
+    *out      = buf;
+    *out_size = us;
+    return 0;
+}
+
+static int apk_read_manifest(const apk_t *a, void **out, size_t *out_size) {
+    if (!a->man.present) return -1;
+    return apk_read_entry(a, a->man.local_off, a->man.method,
+                          a->man.comp_size, a->man.uncomp_size,
+                          out, out_size);
+}
+
+static int apk_read_arsc(const apk_t *a, void **out, size_t *out_size) {
+    if (!a->arsc.present) return -1;
+    return apk_read_entry(a, a->arsc.local_off, a->arsc.method,
+                          a->arsc.comp_size, a->arsc.uncomp_size,
+                          out, out_size);
+}
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
@@ -829,84 +1048,6 @@ typedef struct {
     char abi[64];
 } zip_scan_t;
 
-static void scan_zip(const char *apk_path, zip_scan_t *s) {
-    FILE *f = fopen(apk_path, "rb");
-    if (!f) return;
-
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    if (file_size < 22) { fclose(f); return; }
-
-    long eocd_off = find_eocd(f, file_size);
-    if (eocd_off < 0) { fclose(f); return; }
-
-    uint8_t eocd[22];
-    fseek(f, eocd_off, SEEK_SET);
-    if (fread(eocd, 1, 22, f) != 22) { fclose(f); return; }
-
-    uint32_t cd_offset = rd32le(eocd + 16);
-    uint32_t cd_size   = rd32le(eocd + 12);
-    uint16_t total     = rd16le(eocd + 10);
-
-    if (cd_size == 0 || cd_size > 64 * 1024 * 1024) { fclose(f); return; }
-
-    uint8_t *cd = malloc(cd_size);
-    if (!cd) { fclose(f); return; }
-    fseek(f, cd_offset, SEEK_SET);
-    if (fread(cd, 1, cd_size, f) != cd_size) {
-        free(cd); fclose(f); return;
-    }
-    fclose(f);
-
-    uint32_t pos = 0;
-    for (uint16_t i = 0; i < total; i++) {
-        if (pos + 46 > cd_size) break;
-        if (rd32le(cd + pos) != 0x02014b50) break;
-
-        uint16_t fn_len      = rd16le(cd + pos + 28);
-        uint16_t extra_len   = rd16le(cd + pos + 30);
-        uint16_t comment_len = rd16le(cd + pos + 32);
-
-        if (pos + 46 + fn_len > cd_size) break;
-
-        char name[512];
-        size_t copy = fn_len < sizeof(name) - 1 ? fn_len : sizeof(name) - 1;
-        memcpy(name, cd + pos + 46, copy);
-        name[copy] = 0;
-
-        if (strncmp(name, "classes", 7) == 0 && strcmp(name, "classes.dex") != 0) {
-            const char *p = name + 7;
-            const char *q = p;
-            int digits = 1;
-            while (*q && *q != '.') {
-                if (*q < '0' || *q > '9') { digits = 0; break; }
-                q++;
-            }
-            if (digits && strcmp(q, ".dex") == 0) s->has_multidex = 1;
-        }
-
-        if (strncmp(name, "lib/", 4) == 0) {
-            const char *abi_start = name + 4;
-            const char *abi_end   = strchr(abi_start, '/');
-            if (abi_end && abi_end > abi_start) {
-                const char *file = abi_end + 1;
-                if (strstr(file, ".so")) {
-                    s->has_native = 1;
-                    if (!s->abi[0]) {
-                        size_t len = (size_t)(abi_end - abi_start);
-                        if (len < sizeof(s->abi)) {
-                            memcpy(s->abi, abi_start, len);
-                            s->abi[len] = 0;
-                        }
-                    }
-                }
-            }
-        }
-
-        pos += 46 + fn_len + extra_len + comment_len;
-    }
-    free(cd);
-}
 
 typedef struct {
     const uint8_t  *base;
@@ -1642,15 +1783,6 @@ static uint64_t rd64le(const uint8_t *p) {
          | ((uint64_t)p[7] << 56);
 }
 
-static long mem_find_eocd(const uint8_t *data, size_t size) {
-    if (size < 22) return -1;
-    long max_back = size < 65536 ? size : 65536;
-    for (long i = 22; i <= max_back; i++) {
-        if (rd32le(data + size - i) == 0x06054b50)
-            return size - i;
-    }
-    return -1;
-}
 
 /* Append a certificate to the list */
 static void add_cert(app_info_t *info, int scheme,
@@ -1846,24 +1978,6 @@ static void scan_signatures(const uint8_t *data, size_t size,
     }
 }
 
-static void scan_signatures_mmap(const char *path, app_info_t *info) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { fprintf(stderr, "[sig] open fail: %s\n", path); return; }
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size < 22) {
-        close(fd);
-        fprintf(stderr, "[sig] fstat fail\n");
-        return;
-    }
-    uint8_t *data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (data == MAP_FAILED) {
-        close(fd);
-        return;
-    }
-    scan_signatures(data, st.st_size, info);
-    munmap(data, st.st_size);
-    close(fd);
-}
 
 static int mem_find_entry(const uint8_t *data, size_t size,
                           const char *target,
@@ -1957,15 +2071,12 @@ static int json_get_string(const char *json, const char *key,
 
 /* Try to parse path as an XAPK/APKM container.
  * Returns 1 = container and success, 0 = not a container, -1 = container but failed */
-static int try_container(const char *path, const char *locale,
-                         unsigned int options, app_info_t *info) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size < 100) { close(fd); return 0; }
-    uint8_t *data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (data == MAP_FAILED) { close(fd); return 0; }
-    size_t size = st.st_size;
+static int try_container(const apk_t *apk, const char *path,
+                         const char *locale, unsigned int options,
+                         app_info_t *info) {
+    (void)path;
+    const uint8_t *data = apk->data;
+    size_t         size = apk->size;
 
     int result = 0;
     uint32_t off = 0, cs = 0, us = 0;
@@ -2149,40 +2260,45 @@ static int try_container(const char *path, const char *locale,
     result = 1;
 
 out:
-    munmap(data, size);
-    close(fd);
     return result;
 }
 
 /* Main API */
 static int resolve_framework_name(uint32_t res_id, const char *locale, char *out, size_t out_size);
-int app_info_parse(const char *apk_path,
-                   const char *locale,
-                   unsigned int options,
-                   app_info_t *info)
+int app_info_parse(const char *apk_path, const char *locale,
+                   unsigned int options, app_info_t *info)
 {
     if (!apk_path || !info) return APP_INFO_ERR_IO;
     memset(info, 0, sizeof(*info));
 
-    int cc = try_container(apk_path, locale, options, info);
-    if (cc == 1) return APP_INFO_OK;
-    if (cc < 0) return APP_INFO_ERR_FORMAT;
+    /* Single open + single map for the whole parse. */
+    apk_t apk;
+    if (apk_open(apk_path, &apk) != 0)
+        return APP_INFO_ERR_IO;
 
-    struct stat st;
-    if (stat(apk_path, &st) != 0) return APP_INFO_ERR_IO;
-    format_size(st.st_size, info->apk_size, sizeof(info->apk_size));
+    /* Fields already gathered by the central-directory pass. */
+    info->is_multidex     = apk.has_multidex;
+    info->has_native_libs = apk.has_native;
+    if (apk.abi[0])
+        snprintf(info->abi, sizeof(info->abi), "%s", apk.abi);
 
-    zip_scan_t zs = {0};
-    scan_zip(apk_path, &zs);
-    info->is_multidex     = zs.has_multidex;
-    info->has_native_libs = zs.has_native;
-    if (zs.abi[0]) snprintf(info->abi, sizeof(info->abi), "%s", zs.abi);
+    format_size((long)apk.size, info->apk_size, sizeof(info->apk_size));
 
-    void *axml_data = NULL;
-    size_t axml_size = 0;
-    if (apk_extract(apk_path, "AndroidManifest.xml",
-                    &axml_data, &axml_size) != 0)
+    /* No AndroidManifest.xml: maybe an XAPK / APKM container. */
+    if (!apk.man.present) {
+        int cc = try_container(&apk, apk_path, locale, options, info);
+        apk_close(&apk);
+        if (cc == 1) return APP_INFO_OK;
         return APP_INFO_ERR_FORMAT;
+    }
+
+    /* Read AndroidManifest.xml from the mapping. */
+    void  *axml_data = NULL;
+    size_t axml_size = 0;
+    if (apk_read_manifest(&apk, &axml_data, &axml_size) != 0) {
+        apk_close(&apk);
+        return APP_INFO_ERR_FORMAT;
+    }
 
     parse_ctx_t c;
     memset(&c, 0, sizeof(c));
@@ -2197,45 +2313,60 @@ int app_info_parse(const char *apk_path,
 
     int rc = axml_parse(axml_data, axml_size, &sax, &c);
     free(axml_data);
-    if (rc != 0) return APP_INFO_ERR_FORMAT;
+    if (rc != 0) {
+        apk_close(&apk);
+        return APP_INFO_ERR_FORMAT;
+    }
 
-    /* app_name */
+    /* Resolve app_name:
+     *   launcher activity label > application label > package name */
     if (c.launcher_activity_label_type == 2) {
-        snprintf(info->app_name, sizeof(info->app_name), "%s", c.launcher_activity_label);
+        snprintf(info->app_name, sizeof(info->app_name), "%s",
+                 c.launcher_activity_label);
     } else if (c.launcher_activity_label_type == 1) {
-        void *arsc_data = NULL;
-        size_t arsc_size = 0;
-        if (apk_extract(apk_path, "resources.arsc", &arsc_data, &arsc_size) == 0) {
-            arsc_t *t = arsc_open(arsc_data, arsc_size);
-            if (t) {
-                arsc_config_t req = make_req_config(locale);
-                arsc_get_string(t, c.launcher_activity_label_id, &req,
-                                info->app_name, sizeof(info->app_name));
-                arsc_close(t);
+        if (apk.arsc.present) {
+            void  *arsc_data = NULL;
+            size_t arsc_size = 0;
+            if (apk_read_arsc(&apk, &arsc_data, &arsc_size) == 0) {
+                arsc_t *t = arsc_open(arsc_data, arsc_size);
+                if (t) {
+                    arsc_config_t req = make_req_config(locale);
+                    arsc_get_string(t, c.launcher_activity_label_id, &req,
+                                    info->app_name, sizeof(info->app_name));
+                    arsc_close(t);
+                }
+                free(arsc_data);
             }
-            free(arsc_data);
         }
         if (!info->app_name[0] && (c.launcher_activity_label_id >> 24) == 0x01) {
             resolve_framework_name(c.launcher_activity_label_id, locale,
                                    info->app_name, sizeof(info->app_name));
         }
     } else if (c.app_label_type == 2) {
-        snprintf(info->app_name, sizeof(info->app_name), "%s", c.app_label_str);
+        snprintf(info->app_name, sizeof(info->app_name), "%s",
+                 c.app_label_str);
     } else if (c.app_label_type == 1) {
-        void *arsc_data = NULL;
-        size_t arsc_size = 0;
-        if (apk_extract(apk_path, "resources.arsc", &arsc_data, &arsc_size) == 0) {
-            arsc_t *t = arsc_open(arsc_data, arsc_size);
-            if (t) {
-                arsc_config_t req = make_req_config(locale);
-                arsc_get_string(t, c.app_label_id, &req,
-                                info->app_name, sizeof(info->app_name));
-                arsc_close(t);
+        if (apk.arsc.present) {
+            void  *arsc_data = NULL;
+            size_t arsc_size = 0;
+            if (apk_read_arsc(&apk, &arsc_data, &arsc_size) == 0) {
+                arsc_t *t = arsc_open(arsc_data, arsc_size);
+                if (t) {
+                    arsc_config_t req = make_req_config(locale);
+                    arsc_get_string(t, c.app_label_id, &req,
+                                    info->app_name, sizeof(info->app_name));
+                    arsc_close(t);
+                }
                 free(arsc_data);
             }
         }
+        if (!info->app_name[0] && (c.app_label_id >> 24) == 0x01) {
+            resolve_framework_name(c.app_label_id, locale,
+                                   info->app_name, sizeof(info->app_name));
+        }
     }
 
+    /* Component and permission counts. */
     info->permission_count          = info->permissions.count
                                     + info->permissions_sdk23.count;
     info->declared_permission_count = info->declared_permissions.count;
@@ -2248,7 +2379,6 @@ int app_info_parse(const char *apk_path,
     info->library_count             = info->libraries.count;
     info->native_library_count      = info->native_libraries.count;
 
-    /* Device type flags */
     info->is_automotive = app_info_list_contains(&info->features,
                             "android.hardware.type.automotive");
     info->is_leanback   = app_info_list_contains(&info->features,
@@ -2260,15 +2390,13 @@ int app_info_parse(const char *apk_path,
     info->is_chromebook = app_info_list_contains(&info->features,
                             "android.hardware.type.pc");
 
-    scan_signatures_mmap(apk_path, info);
+    /* Signatures from the same mapping. */
+    scan_signatures(apk.data, apk.size, info);
 
-    if (!info->app_name[0] && c.app_label_type == 1 && (c.app_label_id >> 24) == 0x01) {
-        resolve_framework_name(c.app_label_id, locale, info->app_name, sizeof(info->app_name));
-    }
     if (!info->app_name[0] && info->package[0])
         snprintf(info->app_name, sizeof(info->app_name), "%s", info->package);
 
-
+    apk_close(&apk);
     return APP_INFO_OK;
 }
 

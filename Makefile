@@ -1,6 +1,6 @@
 CC      := gcc
 ROOT    := $(CURDIR)
-CFLAGS  := -std=c99 -Wall -Wextra -I$(ROOT)/include -O2 -fPIC
+CFLAGS  := -std=c99 -Wall -Wextra -Wno-format-truncation -Wno-restrict -I$(ROOT)/include -O2 -fPIC
 LDLIBS  := -lz
 
 BUILD   := $(ROOT)/build
